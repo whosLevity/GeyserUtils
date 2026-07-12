@@ -26,6 +26,7 @@
 package me.zimzaza4.geyserutils.geyser.replace;
 
 import org.cloudburstmc.math.vector.Vector3f;
+import org.cloudburstmc.protocol.bedrock.data.entity.EntityDataTypes;
 import org.geysermc.geyser.GeyserImpl;
 import org.geysermc.geyser.entity.BedrockEntityDefinition;
 import org.geysermc.geyser.entity.EntityTypeDefinition;
@@ -49,6 +50,8 @@ import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.Clie
 
 import static me.zimzaza4.geyserutils.geyser.GeyserUtils.CUSTOM_ENTITIES;
 import static me.zimzaza4.geyserutils.geyser.GeyserUtils.LOADED_ENTITY_DEFINITIONS;
+import static me.zimzaza4.geyserutils.geyser.GeyserUtils.isModelEntitySuppressionActive;
+import static me.zimzaza4.geyserutils.geyser.GeyserUtils.isModelHiddenBaseEntity;
 
 
 public class JavaAddEntityTranslatorReplace extends PacketTranslator<ClientboundAddEntityPacket> {
@@ -56,6 +59,14 @@ public class JavaAddEntityTranslatorReplace extends PacketTranslator<Clientbound
 
     @Override
     public void translate(GeyserSession session, ClientboundAddEntityPacket packet) {
+        if (isModelHiddenBaseEntity(session, packet.getEntityId())) {
+            return;
+        }
+
+        if (packet.getType() == EntityType.AREA_EFFECT_CLOUD && isModelEntitySuppressionActive(session)) {
+            return;
+        }
+
         GeyserEntityType entityType = GeyserEntityType.of(packet.getType());
         if (entityType.isUnregistered()) {
             session.getGeyser().getLogger().warning("Could not find a Geyser entity type for " + entityType);
@@ -75,9 +86,10 @@ public class JavaAddEntityTranslatorReplace extends PacketTranslator<Clientbound
         float headYaw = packet.getHeadYaw();
         EntitySpawnContext context = EntitySpawnContext.fromPacket(session, definition, packet);
 
+        BedrockEntityDefinition customDefinition = null;
         String def = CUSTOM_ENTITIES.get(session).getIfPresent(packet.getEntityId());
         if (def != null) {
-            BedrockEntityDefinition customDefinition = LOADED_ENTITY_DEFINITIONS.get(def);
+            customDefinition = LOADED_ENTITY_DEFINITIONS.get(def);
             if (customDefinition != null) {
                 context.bedrockEntityDefinition(customDefinition);
             }
@@ -122,7 +134,10 @@ public class JavaAddEntityTranslatorReplace extends PacketTranslator<Clientbound
         }
 
         Entity entity;
-        if (packet.getType() == EntityType.FALLING_BLOCK) {
+        if (customDefinition != null) {
+            entity = new Entity(context);
+            entity.getMetadata().put(EntityDataTypes.VISIBLE_MOB_EFFECTS, 0L);
+        } else if (packet.getType() == EntityType.FALLING_BLOCK) {
             entity = new FallingBlockEntity(context, ((FallingBlockData) packet.getData()).getId());
         } else if (packet.getType() == EntityType.FISHING_BOBBER) {
             // Fishing bobbers need the owner for the line

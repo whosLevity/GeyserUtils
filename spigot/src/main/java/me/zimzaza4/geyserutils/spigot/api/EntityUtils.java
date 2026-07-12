@@ -9,6 +9,8 @@ import java.awt.*;
 import java.util.Map;
 
 public class EntityUtils {
+    private static final int MODEL_HIDDEN_BASE_ENTITY_MARKER = Integer.MIN_VALUE + 794;
+    private static final int MODEL_VISIBLE_BASE_ENTITY_MARKER = Integer.MIN_VALUE + 795;
 
     public static void sendCustomHitBox(Player player, int id, float height, float width) {
         CustomEntityDataPacket packet = new CustomEntityDataPacket();
@@ -48,6 +50,13 @@ public class EntityUtils {
         CustomEntityPacket packet = new CustomEntityPacket(entityId, def);
         player.sendPluginMessage(GeyserUtils.getInstance(), GeyserUtilsChannels.MAIN, GeyserUtils.getPacketManager().encodePacket(packet));
 
+    }
+
+    public static void setModelHiddenBaseEntity(Player player, int entityId, boolean hidden) {
+        CustomEntityDataPacket packet = new CustomEntityDataPacket();
+        packet.setEntityId(entityId);
+        packet.setVariant(hidden ? MODEL_HIDDEN_BASE_ENTITY_MARKER : MODEL_VISIBLE_BASE_ENTITY_MARKER);
+        player.sendPluginMessage(GeyserUtils.getInstance(), GeyserUtilsChannels.MAIN, GeyserUtils.getPacketManager().encodePacket(packet));
     }
 
     // (yes I'm aware it's "horrible" code), also this aint player packets at all lmao

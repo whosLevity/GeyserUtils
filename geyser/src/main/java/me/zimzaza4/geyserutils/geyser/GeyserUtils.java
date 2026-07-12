@@ -74,11 +74,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class GeyserUtils implements Extension {
 
 
     public static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    private static final AtomicBoolean LOGGED_CUSTOM_PAYLOAD_DECODE_ERROR = new AtomicBoolean(false);
     private static final Map<String, List<Map.Entry<String, Class<?>>>> properties = new HashMap<>();
     @Getter
     public static PacketManager packetManager = new PacketManager();
@@ -90,6 +93,9 @@ public class GeyserUtils implements Extension {
     public static Map<String, BedrockEntityDefinition> LOADED_ENTITY_DEFINITIONS = new HashMap<>();
     @Getter
     public static Map<GeyserConnection, Cache<Integer, String>> CUSTOM_ENTITIES = new ConcurrentHashMap<>();
+    @Getter
+    public static Map<GeyserConnection, Cache<Integer, Boolean>> MODEL_HIDDEN_BASE_ENTITIES = new ConcurrentHashMap<>();
+    private static final Map<GeyserConnection, Long> MODEL_ENTITY_SUPPRESSION_UNTIL = new ConcurrentHashMap<>();
     static Cape EMPTY_CAPE = new Cape("", "no-cape", new byte[0], true);
     private static List<String> ENTITIES_WAIT_FOR_LOAD = new ArrayList<>();
     @Getter
@@ -98,6 +104,8 @@ public class GeyserUtils implements Extension {
     public static final Integer MAX_VALUE = 1000000;
 
     public static final Integer MIN_VALUE = -1000000;
+    private static final int MODEL_HIDDEN_BASE_ENTITY_MARKER = Integer.MIN_VALUE + 794;
+    private static final int MODEL_VISIBLE_BASE_ENTITY_MARKER = Integer.MIN_VALUE + 795;
 
     public GeyserUtils() {
         instance = this;
@@ -212,6 +220,63 @@ public class GeyserUtils implements Extension {
     private static GeyserEntityProperties buildProperties(String id) {
         GeyserEntityProperties.Builder propertiesBuilder = getProperties(id);
         return propertiesBuilder == null ? new GeyserEntityProperties() : propertiesBuilder.build();
+    }
+
+    public static boolean isLoadedCustomEntity(Entity entity) {
+        return entity != null && entity.bedrockDefinition() instanceof CustomBedrockEntityDefinition;
+    }
+
+    public static Entity getEntityByJavaIdIncludingPlayers(GeyserSession session, int entityId) {
+        Entity entity = session.getEntityCache().getEntityByJavaId(entityId);
+        if (entity != null) {
+            return entity;
+        }
+
+        if (session.getPlayerEntity() != null && session.getPlayerEntity().getEntityId() == entityId) {
+            return session.getPlayerEntity();
+        }
+
+        AtomicReference<Entity> playerEntity = new AtomicReference<>();
+        session.getEntityCache().forEachPlayerEntity(player -> {
+            if (player.getEntityId() == entityId) {
+                playerEntity.compareAndSet(null, player);
+            }
+        });
+        return playerEntity.get();
+    }
+
+    public static boolean isLoadedCustomEntity(GeyserSession session, int entityId) {
+        if (isLoadedCustomEntity(getEntityByJavaIdIncludingPlayers(session, entityId))) {
+            return true;
+        }
+
+        Cache<Integer, String> cache = CUSTOM_ENTITIES.get(session);
+        return cache != null && cache.getIfPresent(entityId) != null;
+    }
+
+    public static boolean isModelHiddenBaseEntity(GeyserSession session, int entityId) {
+        Cache<Integer, Boolean> cache = MODEL_HIDDEN_BASE_ENTITIES.get(session);
+        return cache != null && Boolean.TRUE.equals(cache.getIfPresent(entityId));
+    }
+
+    public static void activateModelEntitySuppression(GeyserSession session) {
+        MODEL_ENTITY_SUPPRESSION_UNTIL.put(session, System.currentTimeMillis() + 8_000L);
+    }
+
+    public static boolean isModelEntitySuppressionActive(GeyserSession session) {
+        Long activeUntil = MODEL_ENTITY_SUPPRESSION_UNTIL.get(session);
+        return activeUntil != null && activeUntil >= System.currentTimeMillis();
+    }
+
+    public static void clearCustomEntityVisibleEffects(GeyserSession session, Entity entity) {
+        if (entity == null) {
+            return;
+        }
+
+        entity.getMetadata().put(EntityDataTypes.VISIBLE_MOB_EFFECTS, 0L);
+        entity.getMetadata().put(EntityDataTypes.EFFECT_COLOR, 0);
+        entity.getMetadata().put(EntityDataTypes.EFFECT_AMBIENCE, (byte) 0);
+        entity.updateBedrockMetadata();
     }
 
     @NotNull
@@ -441,6 +506,7 @@ public class GeyserUtils implements Extension {
     @Subscribe
     public void onSessionJoin(SessionLoginEvent event) {
         CUSTOM_ENTITIES.put(event.connection(), CacheBuilder.newBuilder().expireAfterWrite(30, TimeUnit.SECONDS).build());
+        MODEL_HIDDEN_BASE_ENTITIES.put(event.connection(), CacheBuilder.newBuilder().expireAfterWrite(30, TimeUnit.SECONDS).build());
         if (event.connection() instanceof GeyserSession session) {
             registerPacketListener(session);
         }
@@ -449,6 +515,8 @@ public class GeyserUtils implements Extension {
     @Subscribe
     public void onSessionQuit(SessionDisconnectEvent event) {
         CUSTOM_ENTITIES.remove(event.connection());
+        MODEL_HIDDEN_BASE_ENTITIES.remove(event.connection());
+        MODEL_ENTITY_SUPPRESSION_UNTIL.remove(event.connection());
     }
 
     public void registerPacketListener(GeyserSession session) {
@@ -477,8 +545,14 @@ public class GeyserUtils implements Extension {
                 public void packetReceived(Session tcpSession, Packet packet) {
                     if (packet instanceof ClientboundCustomPayloadPacket payloadPacket) {
                         if (ReflectionUtils.getChannel(payloadPacket).toString().equals(GeyserUtilsChannels.MAIN)) {
-                            CustomPayloadPacket customPacket = packetManager.decodePacket(payloadPacket.getData());
-                            handleCustomPacket(session, customPacket);
+                            try {
+                                CustomPayloadPacket customPacket = packetManager.decodePacket(payloadPacket.getData());
+                                handleCustomPacket(session, customPacket);
+                            } catch (RuntimeException err) {
+                                if (LOGGED_CUSTOM_PAYLOAD_DECODE_ERROR.compareAndSet(false, true)) {
+                                    logger().warning("Ignored a GeyserUtils custom payload that could not be decoded. This usually means the Paper plugin and Geyser extension jars are out of sync: " + err.getMessage());
+                                }
+                            }
                         }
                     }
                 }
@@ -561,6 +635,7 @@ public class GeyserUtils implements Extension {
 
             Cache<Integer, String> cache = CUSTOM_ENTITIES.get(session);
             cache.put(customEntityPacket.getEntityId(), customEntityPacket.getIdentifier());
+            clearCustomEntityVisibleEffects(session, getEntityByJavaIdIncludingPlayers(session, customEntityPacket.getEntityId()));
         } else if (customPacket instanceof CameraInstructionCustomPayloadPacket cameraInstructionPacket) {
             if (cameraInstructionPacket.getInstruction() instanceof SetInstruction instruction) {
                 session.camera().sendCameraPosition(Converter.serializeSetInstruction(instruction));
@@ -580,7 +655,7 @@ public class GeyserUtils implements Extension {
             spawnParticleEffectPacket.setMolangVariablesJson(Optional.ofNullable(customParticleEffectPacket.getParticle().molangVariablesJson()));
             session.sendUpstreamPacket(spawnParticleEffectPacket);
         } else if (customPacket instanceof CustomSkinPayloadPacket customSkinPayloadPacket) {
-            if (session.getEntityCache().getEntityByJavaId(customSkinPayloadPacket.getEntityId()) instanceof PlayerEntity player) {
+            if (getEntityByJavaIdIncludingPlayers(session, customSkinPayloadPacket.getEntityId()) instanceof PlayerEntity player) {
                 SkinData data = LOADED_SKIN_DATA.get(customSkinPayloadPacket.getSkinId());
                 if (data != null) {
                     sendSkinPacket(session, player, data);
@@ -588,7 +663,21 @@ public class GeyserUtils implements Extension {
             }
 
         } else if (customPacket instanceof CustomEntityDataPacket customEntityDataPacket) {
-            Entity entity = session.getEntityCache().getEntityByJavaId(customEntityDataPacket.getEntityId());
+            Integer variant = customEntityDataPacket.getVariant();
+            if (variant != null && (variant == MODEL_HIDDEN_BASE_ENTITY_MARKER || variant == MODEL_VISIBLE_BASE_ENTITY_MARKER)) {
+                Cache<Integer, Boolean> cache = MODEL_HIDDEN_BASE_ENTITIES.get(session);
+                if (cache != null) {
+                    if (variant == MODEL_HIDDEN_BASE_ENTITY_MARKER) {
+                        cache.put(customEntityDataPacket.getEntityId(), true);
+                        activateModelEntitySuppression(session);
+                    } else {
+                        cache.invalidate(customEntityDataPacket.getEntityId());
+                    }
+                }
+                return;
+            }
+
+            Entity entity = getEntityByJavaIdIncludingPlayers(session, customEntityDataPacket.getEntityId());
             if (entity != null) {
                 if (customEntityDataPacket.getHeight() != null)
                     entity.setBoundingBoxHeight(customEntityDataPacket.getHeight());
@@ -603,7 +692,7 @@ public class GeyserUtils implements Extension {
                 entity.updateBedrockMetadata();
             }
         } else if (customPacket instanceof EntityPropertyPacket entityPropertyPacket) {
-            Entity entity = session.getEntityCache().getEntityByJavaId(entityPropertyPacket.getEntityId());
+            Entity entity = getEntityByJavaIdIncludingPlayers(session, entityPropertyPacket.getEntityId());
             if (entity != null) {
                 if (entityPropertyPacket.getIdentifier() == null
                         || entityPropertyPacket.getValue() == null) return;
@@ -620,7 +709,7 @@ public class GeyserUtils implements Extension {
             if (entityPropertyRegisterPacket.getIdentifier() == null
                     || entityPropertyRegisterPacket.getType() == null) return;
 
-            Entity entity = (session.getEntityCache().getEntityByJavaId(entityPropertyRegisterPacket.getEntityId()));
+            Entity entity = getEntityByJavaIdIncludingPlayers(session, entityPropertyRegisterPacket.getEntityId());
             if (entity != null) {
                 String def = CUSTOM_ENTITIES.get(session).getIfPresent(entity.getEntityId());
                 if (def == null) return;
